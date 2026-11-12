@@ -13,6 +13,7 @@ from transformers.models.deberta_v2.modeling_deberta_v2 import (
     DebertaV2PreTrainedModel,
     DebertaV2Model,
 )
+from transformers import DebertaV2Config
 from transformers.models.bert.modeling_bert import BertPooler
 import global_configs
 from global_configs import DEVICE
@@ -259,7 +260,42 @@ class DeBertaForSequenceClassification(DebertaV2PreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.dberta = DebertaModel(config, multimodal_config)
-        self.init_weights()
+        # The text encoder has already loaded its pretrained weights.
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args,
+                        multimodal_config, num_labels=1, **kwargs):
+        """Build CaReFlow with a pretrained DeBERTa text encoder."""
+        multimodal_config.text_model = pretrained_model_name_or_path
+        config = DebertaV2Config.from_pretrained(
+            pretrained_model_name_or_path, num_labels=num_labels
+        )
+        model = cls(config, multimodal_config=multimodal_config)
+        meta_params = [name for name, param in model.named_parameters() if param.is_meta]
+        if meta_params:
+            raise RuntimeError(f"Uninitialized parameters: {meta_params[:10]}")
+
+        devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+        with torch.random.fork_rng(devices=devices):
+            reference = DebertaV2Model.from_pretrained(
+                pretrained_model_name_or_path, local_files_only=True
+            )
+            expected_state = reference.state_dict()
+            actual_state = model.dberta.model.state_dict()
+            missing = set(expected_state) - set(actual_state)
+            unexpected = set(actual_state) - set(expected_state)
+            if missing or unexpected:
+                raise RuntimeError(
+                    f"DeBERTa parameter names differ: missing={missing}, unexpected={unexpected}"
+                )
+            for name, expected in expected_state.items():
+                actual = actual_state[name]
+                if actual.shape != expected.shape or not torch.equal(
+                    actual.detach().cpu(), expected.detach().cpu()
+                ):
+                    raise RuntimeError(f"DeBERTa pretrained weight mismatch: {name}")
+            print(f"DeBERTa weights verified: {len(expected_state)} tensors")
+        return model
 
     def forward(self, input_ids, visual, acoustic, label_ids=None,
                 input_mask=None):
